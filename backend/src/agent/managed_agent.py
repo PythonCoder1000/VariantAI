@@ -8,7 +8,7 @@ from .client import get_client
 from .skills import ALL_SKILLS
 
 AGENT_ID = "variantai-agent"
-BASE_AGENT = "antigravity-preview-05-2026"
+BASE_AGENT = "gemini-3.5-flash"
 
 # Domains the agent sandbox is allowed to reach
 NETWORK_ALLOWLIST = [
