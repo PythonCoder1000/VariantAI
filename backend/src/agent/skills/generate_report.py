@@ -69,40 +69,13 @@ While it modestly increases the risk of lung cancer in people who smoke, it does
 on its own. If you are concerned about your personal risk, speaking with a genetic counselor
 is recommended."
 
-## Python Code
+## How to Complete Step 9
 
-```python
-import json, os
+Do NOT run Python code for this step. Instead:
 
-raw_dir = "/workspace/raw"
-raw_data = {}
-for fname in ["clinvar.json", "dbsnp.json", "gnomad.json", "gene.json",
-              "uniprot.json", "pubmed.json", "ensembl.json"]:
-    fpath = os.path.join(raw_dir, fname)
-    if os.path.exists(fpath):
-        with open(fpath) as f:
-            raw_data[fname.replace(".json", "")] = json.load(f)
-    else:
-        raw_data[fname.replace(".json", "")] = None
+1. Read all raw files from /workspace/raw/ (clinvar, dbsnp, gnomad, gene, uniprot, pubmed, ensembl)
+2. Synthesize the data according to the section guidelines above
+3. Call the **submit_report** function with the completed report fields
 
-print("=== RAW DATA LOADED ===")
-for db, data in raw_data.items():
-    status = "OK" if data and not data.get("error") and not data.get("found") == False else "MISSING/ERROR"
-    print(f"  {db}: {status}")
-
-# The agent synthesizes all raw_data into the report JSON per the schema above,
-# then prints it wrapped in the markers below.
-print("Now synthesizing report from all loaded data...")
-```
-
-After printing the synthesis, output the final report JSON wrapped EXACTLY like this — no other
-text between the markers:
-
-```
-===REPORT_START===
-{
-  ...complete JSON here...
-}
-===REPORT_END===
-```
+The submit_report function accepts exactly the fields shown in the schema above.
 """

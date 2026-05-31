@@ -3,9 +3,57 @@ import json
 import os
 import re
 
+from google.genai import types
+
 from .agents_md import AGENTS_MD
 from .client import get_client
 from .skills import ALL_SKILLS
+
+# ---------------------------------------------------------------------------
+# Function-calling tool: submit_report
+# The agent calls this instead of printing JSON markers, giving us guaranteed
+# structured output without any text parsing.
+# ---------------------------------------------------------------------------
+_SUBMIT_REPORT_DECL = types.FunctionDeclaration(
+    name="submit_report",
+    description=(
+        "Submit the final structured genomic variant analysis report. "
+        "Call this ONCE after completing all 8 database queries."
+    ),
+    parameters=types.Schema(
+        type=types.Type.OBJECT,
+        properties={
+            "variant_id": types.Schema(type=types.Type.STRING),
+            "gene": types.Schema(type=types.Type.STRING),
+            "variant_type": types.Schema(type=types.Type.STRING),
+            "clinical_risk": types.Schema(type=types.Type.STRING),
+            "gene_function": types.Schema(type=types.Type.STRING),
+            "structural_impact": types.Schema(type=types.Type.STRING),
+            "research_summary": types.Schema(type=types.Type.STRING),
+            "bottom_line": types.Schema(type=types.Type.STRING),
+            "confidence": types.Schema(
+                type=types.Type.STRING,
+                enum=["high", "medium", "low"],
+            ),
+            "sources": types.Schema(
+                type=types.Type.ARRAY,
+                items=types.Schema(type=types.Type.OBJECT),
+            ),
+        },
+        required=[
+            "variant_id",
+            "clinical_risk",
+            "gene_function",
+            "structural_impact",
+            "research_summary",
+            "bottom_line",
+            "confidence",
+            "sources",
+        ],
+    ),
+)
+
+SUBMIT_REPORT_TOOL = types.Tool(function_declarations=[_SUBMIT_REPORT_DECL])
 
 AGENT_ID = "variantai-agent"
 BASE_AGENT = "antigravity-preview-05-2026"
@@ -82,9 +130,9 @@ Now follow your AGENTS.md workflow exactly, using {rs_id} wherever you see RS_ID
 6. Run the query-uniprot skill using that gene symbol
 7. Run the query-pubmed skill for {rs_id} and the gene symbol
 8. Run the query-ensembl skill for {rs_id}
-9. Run the generate-report skill to produce the final JSON
+9. Read all /workspace/raw/*.json files, synthesize the results, and call the submit_report function
 
-Do not skip any step. Output the final report wrapped in ===REPORT_START=== / ===REPORT_END===.
+Do not skip any step. For step 9, call submit_report() — do not print markers.
 """.strip()
 
 
@@ -142,6 +190,31 @@ def _extract_report(output: str) -> dict | None:
                     pass
                 start = None
 
+    return None
+
+
+def _extract_fc_args(event) -> dict | None:
+    """Return submit_report arguments if this event carries a function call."""
+    candidates = [
+        getattr(event, "step", None),
+        getattr(event, "function_call", None),
+        getattr(event, "delta", None),
+    ]
+    for obj in candidates:
+        if obj is None:
+            continue
+        name = getattr(obj, "name", None)
+        if name and name != "submit_report":
+            continue
+        for attr in ("arguments", "args", "parameters"):
+            val = getattr(obj, attr, None)
+            if isinstance(val, dict):
+                return val
+            if isinstance(val, str):
+                try:
+                    return json.loads(val)
+                except json.JSONDecodeError:
+                    pass
     return None
 
 
@@ -214,10 +287,16 @@ async def run_analysis_streaming(rs_id: str):
                 input=prompt,
                 environment="remote",
                 stream=True,
+                tools=[SUBMIT_REPORT_TOOL],
             )
+
+            fc_report: dict | None = None
+            fc_args_buf = ""
 
             for event in stream:
                 event_type = getattr(event, "event_type", None)
+                attrs = [a for a in dir(event) if not a.startswith("_")]
+                print(f"[DEBUG] event_type={event_type!r} attrs={attrs}", flush=True)
 
                 # Surface agent-side failures immediately.
                 if event_type == "error":
@@ -235,9 +314,32 @@ async def run_analysis_streaming(rs_id: str):
                         raise RuntimeError(f"Interaction {status}")
                     continue
 
-                # Real output streams via step.delta (incremental) and
-                # step.start (full step). The interaction.completed event
-                # intentionally carries empty steps, so we never rely on it.
+                # Check for a complete submit_report function call.
+                fc = _extract_fc_args(event)
+                if fc is not None:
+                    fc_report = fc
+                    print(f"[DEBUG] submit_report function call captured: {fc}", flush=True)
+
+                # Accumulate incremental function-call argument chunks.
+                delta = getattr(event, "delta", None)
+                if delta is not None:
+                    dtype = getattr(delta, "type", None)
+                    if dtype in ("arguments_delta", "function_call"):
+                        name = getattr(delta, "name", None) or getattr(delta, "function_name", None)
+                        if name is None or name == "submit_report":
+                            chunk = (
+                                getattr(delta, "arguments_delta", None)
+                                or getattr(delta, "arguments", None)
+                                or ""
+                            )
+                            if chunk:
+                                fc_args_buf += chunk
+                                try:
+                                    fc_report = json.loads(fc_args_buf)
+                                except json.JSONDecodeError:
+                                    pass
+
+                # Stream text progress to the frontend.
                 if event_type == "step.delta":
                     text = _delta_text(getattr(event, "delta", None))
                 elif event_type == "step.start":
@@ -250,7 +352,13 @@ async def run_analysis_streaming(rs_id: str):
                     sse = f"event: progress\ndata: {json.dumps({'text': text})}\n\n"
                     loop.call_soon_threadsafe(queue.put_nowait, sse)
 
-            report = _extract_report(full_output)
+            print(
+                f"[DEBUG] fc_report={fc_report is not None} "
+                f"full_output length={len(full_output)} preview={full_output[:300]!r}",
+                flush=True,
+            )
+            # Prefer the function call result; fall back to text marker extraction.
+            report = fc_report or _extract_report(full_output)
             if report:
                 sse = f"event: complete\ndata: {json.dumps({'report': report})}\n\n"
             else:
