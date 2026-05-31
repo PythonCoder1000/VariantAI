@@ -1,65 +1,132 @@
-import Image from "next/image";
+"use client";
+
+import { useState } from "react";
+import VariantInput from "@/components/VariantInput";
+import AnalysisProgress from "@/components/AnalysisProgress";
+import ReportCard from "@/components/ReportCard";
+
+interface VariantReport {
+  variant_id: string;
+  gene?: string;
+  variant_type?: string;
+  clinical_risk: string;
+  gene_function: string;
+  structural_impact: string;
+  research_summary: string;
+  bottom_line: string;
+  confidence: string;
+  sources: Array<{ db: string; [key: string]: unknown }>;
+}
+
+type Status = "idle" | "analyzing" | "complete" | "error";
 
 export default function Home() {
+  const [status, setStatus] = useState<Status>("idle");
+  const [progressLog, setProgressLog] = useState<string[]>([]);
+  const [report, setReport] = useState<VariantReport | null>(null);
+  const [error, setError] = useState<string | null>(null);
+
+  const handleAnalyze = async (rsId: string) => {
+    setStatus("analyzing");
+    setProgressLog([]);
+    setReport(null);
+    setError(null);
+
+    const apiUrl = process.env.NEXT_PUBLIC_API_URL ?? "http://localhost:8000";
+
+    let response: Response;
+    try {
+      response = await fetch(`${apiUrl}/api/analyze`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ variant_id: rsId }),
+      });
+    } catch {
+      setError("Could not reach the analysis server. Is the backend running?");
+      setStatus("error");
+      return;
+    }
+
+    if (!response.ok || !response.body) {
+      setError(`Server error: ${response.status} ${response.statusText}`);
+      setStatus("error");
+      return;
+    }
+
+    const reader = response.body.getReader();
+    const decoder = new TextDecoder();
+    let buffer = "";
+
+    try {
+      while (true) {
+        const { value, done } = await reader.read();
+        if (done) break;
+        buffer += decoder.decode(value, { stream: true });
+
+        const messages = buffer.split("\n\n");
+        buffer = messages.pop() ?? "";
+
+        for (const msg of messages) {
+          const eventMatch = msg.match(/^event:\s*(\w+)/m);
+          const dataMatch = msg.match(/^data:\s*(.+)$/m);
+          if (!eventMatch || !dataMatch) continue;
+
+          const eventType = eventMatch[1];
+          const data = JSON.parse(dataMatch[1]);
+
+          if (eventType === "progress") {
+            setProgressLog((prev) => [...prev, data.text ?? ""]);
+          } else if (eventType === "complete") {
+            if (data.report) {
+              setReport(data.report as VariantReport);
+              setStatus("complete");
+            } else {
+              setError(data.error ?? "Analysis finished but report could not be parsed.");
+              setStatus("error");
+            }
+          } else if (eventType === "error") {
+            setError(data.error ?? "Unknown error from server.");
+            setStatus("error");
+          }
+        }
+      }
+    } catch (err) {
+      setError(`Stream read error: ${String(err)}`);
+      setStatus("error");
+    }
+  };
+
   return (
-    <div className="flex flex-col flex-1 items-center justify-center bg-zinc-50 font-sans dark:bg-black">
-      <main className="flex flex-1 w-full max-w-3xl flex-col items-center justify-between py-32 px-16 bg-white dark:bg-black sm:items-start">
-        <Image
-          className="dark:invert"
-          src="/next.svg"
-          alt="Next.js logo"
-          width={100}
-          height={20}
-          priority
-        />
-        <div className="flex flex-col items-center gap-6 text-center sm:items-start sm:text-left">
-          <h1 className="max-w-xs text-3xl font-semibold leading-10 tracking-tight text-black dark:text-zinc-50">
-            To get started, edit the page.tsx file.
-          </h1>
-          <p className="max-w-md text-lg leading-8 text-zinc-600 dark:text-zinc-400">
-            Looking for a starting point or more instructions? Head over to{" "}
-            <a
-              href="https://vercel.com/templates?framework=next.js&utm_source=create-next-app&utm_medium=appdir-template-tw&utm_campaign=create-next-app"
-              className="font-medium text-zinc-950 dark:text-zinc-50"
-            >
-              Templates
-            </a>{" "}
-            or the{" "}
-            <a
-              href="https://nextjs.org/learn?utm_source=create-next-app&utm_medium=appdir-template-tw&utm_campaign=create-next-app"
-              className="font-medium text-zinc-950 dark:text-zinc-50"
-            >
-              Learning
-            </a>{" "}
-            center.
+    <main className="min-h-screen bg-gray-950">
+      <div className="max-w-3xl mx-auto px-4 py-16">
+        {/* Header */}
+        <div className="text-center mb-12">
+          <h1 className="text-4xl font-bold text-gray-100 mb-3">VariantAI</h1>
+          <p className="text-lg text-gray-500">
+            Enter a genomic rsID to receive a plain-language clinical analysis.
           </p>
         </div>
-        <div className="flex flex-col gap-4 text-base font-medium sm:flex-row">
-          <a
-            className="flex h-12 w-full items-center justify-center gap-2 rounded-full bg-foreground px-5 text-background transition-colors hover:bg-[#383838] dark:hover:bg-[#ccc] md:w-[158px]"
-            href="https://vercel.com/new?utm_source=create-next-app&utm_medium=appdir-template-tw&utm_campaign=create-next-app"
-            target="_blank"
-            rel="noopener noreferrer"
-          >
-            <Image
-              className="dark:invert"
-              src="/vercel.svg"
-              alt="Vercel logomark"
-              width={16}
-              height={16}
-            />
-            Deploy Now
-          </a>
-          <a
-            className="flex h-12 w-full items-center justify-center rounded-full border border-solid border-black/[.08] px-5 transition-colors hover:border-transparent hover:bg-black/[.04] dark:border-white/[.145] dark:hover:bg-[#1a1a1a] md:w-[158px]"
-            href="https://nextjs.org/docs?utm_source=create-next-app&utm_medium=appdir-template-tw&utm_campaign=create-next-app"
-            target="_blank"
-            rel="noopener noreferrer"
-          >
-            Documentation
-          </a>
-        </div>
-      </main>
-    </div>
+
+        {/* Input */}
+        <VariantInput onAnalyze={handleAnalyze} disabled={status === "analyzing"} />
+
+        {/* Progress */}
+        {status === "analyzing" && (
+          <AnalysisProgress log={progressLog} />
+        )}
+
+        {/* Report */}
+        {status === "complete" && report && (
+          <ReportCard report={report} />
+        )}
+
+        {/* Error */}
+        {status === "error" && error && (
+          <div className="mt-8 p-4 bg-red-950/50 border border-red-800 rounded-lg">
+            <p className="text-red-400"><strong>Error:</strong> {error}</p>
+          </div>
+        )}
+      </div>
+    </main>
   );
 }
