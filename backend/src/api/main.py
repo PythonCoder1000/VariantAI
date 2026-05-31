@@ -18,7 +18,7 @@ limiter = Limiter(key_func=get_remote_address)
 
 app = FastAPI(
     title="VariantAI API",
-    version="0.9.0",
+    version="0.9.1",
     description="Genomic variant analysis powered by Google Managed Agents (Gemini 3.5 Flash)",
 )
 

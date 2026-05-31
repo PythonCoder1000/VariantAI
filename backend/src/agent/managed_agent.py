@@ -85,19 +85,33 @@ def _set_cached(rs_id: str, report: dict) -> None:
 
 
 def _check_variant_exists(rs_id: str) -> bool:
-    """Return False only when dbSNP definitively returns HTTP 404 for this rsID.
+    """Return False only when NCBI dbSNP definitively reports the rsID does not exist.
 
-    Any other status (200, 5xx, timeout, network error) returns True so the
-    agent run proceeds — fail-open to avoid false "unknown variant" pages.
+    Uses the Entrez esearch UID query (``{rs_num}[uid]`` against the ``snp`` db),
+    which returns ``count == 0`` for non-existent rsIDs and ``count >= 1`` for real
+    ones. Any error, timeout, malformed response, or HTTP failure returns True so
+    the agent run proceeds — fail-open to avoid false "unknown variant" pages.
     """
+    rs_num = rs_id.lstrip("rRsS")
+    if not rs_num.isdigit():
+        return True
     try:
-        rs_num = rs_id.lstrip("rRsS")
         resp = httpx.get(
-            f"https://api.ncbi.nlm.nih.gov/variation/v0/beta/refsnp/{rs_num}",
-            headers={"Accept": "application/json"},
+            "https://eutils.ncbi.nlm.nih.gov/entrez/eutils/esearch.fcgi",
+            params={
+                "db": "snp",
+                "term": f"{rs_num}[uid]",
+                "retmode": "json",
+                "api_key": os.environ.get("NCBI_API_KEY", ""),
+                "email": os.environ.get("NCBI_EMAIL", ""),
+            },
             timeout=8.0,
         )
-        return resp.status_code != 404
+        if resp.status_code != 200:
+            return True
+        count = resp.json().get("esearchresult", {}).get("count")
+        # Only declare "not found" when NCBI explicitly returns zero matches.
+        return count != "0"
     except Exception:
         return True
 
