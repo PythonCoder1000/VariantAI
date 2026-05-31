@@ -19,7 +19,7 @@ limiter = Limiter(key_func=get_remote_address)
 
 app = FastAPI(
     title="VariantAI API",
-    version="0.10.0",
+    version="0.10.1",
     description="Genomic variant analysis powered by Google Managed Agents (Gemini 3.5 Flash)",
 )
 
@@ -30,7 +30,7 @@ app.add_middleware(
     CORSMiddleware,
     allow_origins=os.environ.get("ALLOWED_ORIGINS", "http://localhost:3000").split(","),
     allow_credentials=True,
-    allow_methods=["GET", "POST", "OPTIONS"],
+    allow_methods=["GET", "POST", "DELETE", "OPTIONS"],
     allow_headers=["*"],
 )
 
@@ -46,7 +46,7 @@ async def startup_event():
 
 @app.get("/api/health")
 async def health_check():
-    return {"status": "ok", "version": "0.10.0"}
+    return {"status": "ok", "version": "0.10.1"}
 
 
 @app.post("/api/analyze")
