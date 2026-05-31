@@ -9,47 +9,46 @@ from .client import get_client
 from .skills import ALL_SKILLS
 
 # ---------------------------------------------------------------------------
-# Function-calling tool: submit_report
-# The agent calls this instead of printing JSON markers, giving us guaranteed
-# structured output without any text parsing.
+# Structured output via response_format.
 #
-# The Managed Agents API expects a flat ToolParam dict — {type, name,
-# description, parameters} where `parameters` is a plain JSON Schema object —
-# NOT the google.genai.types.Tool(function_declarations=...) wrapper used by
-# the base Gemini models API.
+# Custom `function` tools are NOT permitted when interacting with a stored
+# code-execution agent ("Tool 'function' is not allowed when interacting with
+# this agent") — the only agent-level tool types are code_execution,
+# google_search, url_context and mcp_server. The Managed Agents API's native
+# mechanism for guaranteed structured output is a `response_format` of type
+# "text" with mime_type "application/json" and a JSON Schema, which constrains
+# the agent's final message to valid JSON conforming to the schema.
 # ---------------------------------------------------------------------------
-SUBMIT_REPORT_TOOL: dict = {
-    "type": "function",
-    "name": "submit_report",
-    "description": (
-        "Submit the final structured genomic variant analysis report. "
-        "Call this ONCE after completing all 8 database queries."
-    ),
-    "parameters": {
-        "type": "object",
-        "properties": {
-            "variant_id": {"type": "string"},
-            "gene": {"type": "string"},
-            "variant_type": {"type": "string"},
-            "clinical_risk": {"type": "string"},
-            "gene_function": {"type": "string"},
-            "structural_impact": {"type": "string"},
-            "research_summary": {"type": "string"},
-            "bottom_line": {"type": "string"},
-            "confidence": {"type": "string", "enum": ["high", "medium", "low"]},
-            "sources": {"type": "array", "items": {"type": "object"}},
-        },
-        "required": [
-            "variant_id",
-            "clinical_risk",
-            "gene_function",
-            "structural_impact",
-            "research_summary",
-            "bottom_line",
-            "confidence",
-            "sources",
-        ],
+REPORT_SCHEMA: dict = {
+    "type": "object",
+    "properties": {
+        "variant_id": {"type": "string"},
+        "gene": {"type": "string"},
+        "variant_type": {"type": "string"},
+        "clinical_risk": {"type": "string"},
+        "gene_function": {"type": "string"},
+        "structural_impact": {"type": "string"},
+        "research_summary": {"type": "string"},
+        "bottom_line": {"type": "string"},
+        "confidence": {"type": "string", "enum": ["high", "medium", "low"]},
+        "sources": {"type": "array", "items": {"type": "object"}},
     },
+    "required": [
+        "variant_id",
+        "clinical_risk",
+        "gene_function",
+        "structural_impact",
+        "research_summary",
+        "bottom_line",
+        "confidence",
+        "sources",
+    ],
+}
+
+REPORT_RESPONSE_FORMAT: dict = {
+    "type": "text",
+    "mime_type": "application/json",
+    "schema": REPORT_SCHEMA,
 }
 
 AGENT_ID = "variantai-agent"
@@ -127,9 +126,10 @@ Now follow your AGENTS.md workflow exactly, using {rs_id} wherever you see RS_ID
 6. Run the query-uniprot skill using that gene symbol
 7. Run the query-pubmed skill for {rs_id} and the gene symbol
 8. Run the query-ensembl skill for {rs_id}
-9. Read all /workspace/raw/*.json files, synthesize the results, and call the submit_report function
+9. Read all /workspace/raw/*.json files, synthesize the results, and output the final report
 
-Do not skip any step. For step 9, call submit_report() — do not print markers.
+Do not skip any step. For step 9, your final message must be ONLY the JSON report object
+(no prose, no code fences, no markers) conforming to the required schema.
 """.strip()
 
 
@@ -190,39 +190,21 @@ def _extract_report(output: str) -> dict | None:
     return None
 
 
-def _fc_args_from_step(step) -> dict | None:
-    """Return submit_report arguments from a single Step, if it is that call.
+def _final_text_from_steps(steps) -> str:
+    """Concatenate the text of all model_output steps in a completed interaction.
 
-    A ``FunctionCallStep`` has ``type == "function_call"``, ``name``, and
-    ``arguments`` — which the Managed Agents SDK delivers as an already-parsed
-    ``dict`` (not a JSON string). We ignore empty-argument steps so a partially
-    populated ``step.start`` never clobbers the final value.
+    With response_format=json the agent's final model_output carries the report
+    JSON. The completed interaction holds the full, non-streamed step list, so
+    this is the authoritative source for extraction (more reliable than the
+    accumulated stream deltas).
     """
-    if step is None:
-        return None
-    if getattr(step, "type", None) != "function_call":
-        return None
-    if getattr(step, "name", None) != "submit_report":
-        return None
-    args = getattr(step, "arguments", None)
-    if isinstance(args, dict) and args:
-        return args
-    if isinstance(args, str) and args.strip():
-        try:
-            parsed = json.loads(args)
-            return parsed if isinstance(parsed, dict) else None
-        except json.JSONDecodeError:
-            return None
-    return None
-
-
-def _fc_args_from_steps(steps) -> dict | None:
-    """Scan a list of Steps (from interaction.completed) for the submit_report call."""
+    parts: list[str] = []
     for step in steps or []:
-        args = _fc_args_from_step(step)
-        if args is not None:
-            return args
-    return None
+        if getattr(step, "type", None) == "model_output":
+            for content in getattr(step, "content", None) or []:
+                if getattr(content, "type", None) == "text" and getattr(content, "text", None):
+                    parts.append(content.text)
+    return "".join(parts)
 
 
 def _normalize_report(report: dict, rs_id: str) -> dict:
@@ -309,10 +291,10 @@ async def run_analysis_streaming(rs_id: str):
                 input=prompt,
                 environment="remote",
                 stream=True,
-                tools=[SUBMIT_REPORT_TOOL],
+                response_format=[REPORT_RESPONSE_FORMAT],
             )
 
-            fc_report: dict | None = None
+            final_text = ""
 
             for event in stream:
                 event_type = getattr(event, "event_type", None)
@@ -334,25 +316,18 @@ async def run_analysis_streaming(rs_id: str):
                     continue
 
                 # Authoritative source: the completed interaction carries the
-                # full list of steps, including the submit_report FunctionCallStep
-                # with its fully-populated arguments dict.
+                # full, non-streamed step list. With response_format=json the
+                # report JSON is the concatenated model_output text.
                 if event_type == "interaction.completed":
                     interaction = getattr(event, "interaction", None)
                     steps = getattr(interaction, "steps", None) if interaction else None
-                    fc = _fc_args_from_steps(steps)
-                    if fc is not None:
-                        fc_report = fc
+                    final_text = _final_text_from_steps(steps)
                     continue
 
-                # Real output streams via step.delta (incremental) and step.start
-                # (full step). A function call may also appear as a complete
-                # step.start — capture it as a fallback to interaction.completed.
+                # Stream progress text to the frontend (step.delta incremental,
+                # step.start full step).
                 if event_type == "step.start":
-                    step = getattr(event, "step", None)
-                    fc = _fc_args_from_step(step)
-                    if fc is not None:
-                        fc_report = fc
-                    text = _step_text(step)
+                    text = _step_text(getattr(event, "step", None))
                 elif event_type == "step.delta":
                     text = _delta_text(getattr(event, "delta", None))
                 else:
@@ -363,12 +338,12 @@ async def run_analysis_streaming(rs_id: str):
                     sse = f"event: progress\ndata: {json.dumps({'text': text})}\n\n"
                     loop.call_soon_threadsafe(queue.put_nowait, sse)
 
-            # Prefer the structured function call; fall back to text-marker parsing
-            # in case the model printed a report instead of calling submit_report.
-            report = fc_report or _extract_report(full_output)
+            # Prefer the authoritative final text from the completed interaction;
+            # fall back to the accumulated stream output.
+            report = _extract_report(final_text) or _extract_report(full_output)
             print(
-                f"[VariantAI] rs_id={rs_id} fc_call={fc_report is not None} "
-                f"report_parsed={report is not None} output_len={len(full_output)}",
+                f"[VariantAI] rs_id={rs_id} report_parsed={report is not None} "
+                f"final_len={len(final_text)} stream_len={len(full_output)}",
                 flush=True,
             )
             if report:
@@ -378,7 +353,7 @@ async def run_analysis_streaming(rs_id: str):
                 payload = json.dumps(
                     {
                         "report": None,
-                        "raw_output": full_output[:2000],
+                        "raw_output": (final_text or full_output)[:2000],
                         "error": "Could not extract structured report",
                     }
                 )

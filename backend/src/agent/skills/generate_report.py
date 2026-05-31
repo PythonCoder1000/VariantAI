@@ -75,7 +75,8 @@ Do NOT run Python code for this step. Instead:
 
 1. Read all raw files from /workspace/raw/ (clinvar, dbsnp, gnomad, gene, uniprot, pubmed, ensembl)
 2. Synthesize the data according to the section guidelines above
-3. Call the **submit_report** function with the completed report fields
+3. Output your final message as ONLY the JSON report object conforming to the schema above
 
-The submit_report function accepts exactly the fields shown in the schema above.
+Your final message must contain nothing but the JSON object — no prose, no code fences,
+no markers. It must include every required field shown in the schema.
 """
