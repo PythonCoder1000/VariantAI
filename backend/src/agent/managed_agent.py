@@ -3,8 +3,7 @@ import json
 import os
 import re
 
-from google.genai import types
-
+from ..models.schemas import VariantReport
 from .agents_md import AGENTS_MD
 from .client import get_client
 from .skills import ALL_SKILLS
@@ -13,34 +12,34 @@ from .skills import ALL_SKILLS
 # Function-calling tool: submit_report
 # The agent calls this instead of printing JSON markers, giving us guaranteed
 # structured output without any text parsing.
+#
+# The Managed Agents API expects a flat ToolParam dict — {type, name,
+# description, parameters} where `parameters` is a plain JSON Schema object —
+# NOT the google.genai.types.Tool(function_declarations=...) wrapper used by
+# the base Gemini models API.
 # ---------------------------------------------------------------------------
-_SUBMIT_REPORT_DECL = types.FunctionDeclaration(
-    name="submit_report",
-    description=(
+SUBMIT_REPORT_TOOL: dict = {
+    "type": "function",
+    "name": "submit_report",
+    "description": (
         "Submit the final structured genomic variant analysis report. "
         "Call this ONCE after completing all 8 database queries."
     ),
-    parameters=types.Schema(
-        type=types.Type.OBJECT,
-        properties={
-            "variant_id": types.Schema(type=types.Type.STRING),
-            "gene": types.Schema(type=types.Type.STRING),
-            "variant_type": types.Schema(type=types.Type.STRING),
-            "clinical_risk": types.Schema(type=types.Type.STRING),
-            "gene_function": types.Schema(type=types.Type.STRING),
-            "structural_impact": types.Schema(type=types.Type.STRING),
-            "research_summary": types.Schema(type=types.Type.STRING),
-            "bottom_line": types.Schema(type=types.Type.STRING),
-            "confidence": types.Schema(
-                type=types.Type.STRING,
-                enum=["high", "medium", "low"],
-            ),
-            "sources": types.Schema(
-                type=types.Type.ARRAY,
-                items=types.Schema(type=types.Type.OBJECT),
-            ),
+    "parameters": {
+        "type": "object",
+        "properties": {
+            "variant_id": {"type": "string"},
+            "gene": {"type": "string"},
+            "variant_type": {"type": "string"},
+            "clinical_risk": {"type": "string"},
+            "gene_function": {"type": "string"},
+            "structural_impact": {"type": "string"},
+            "research_summary": {"type": "string"},
+            "bottom_line": {"type": "string"},
+            "confidence": {"type": "string", "enum": ["high", "medium", "low"]},
+            "sources": {"type": "array", "items": {"type": "object"}},
         },
-        required=[
+        "required": [
             "variant_id",
             "clinical_risk",
             "gene_function",
@@ -50,10 +49,8 @@ _SUBMIT_REPORT_DECL = types.FunctionDeclaration(
             "confidence",
             "sources",
         ],
-    ),
-)
-
-SUBMIT_REPORT_TOOL = types.Tool(function_declarations=[_SUBMIT_REPORT_DECL])
+    },
+}
 
 AGENT_ID = "variantai-agent"
 BASE_AGENT = "antigravity-preview-05-2026"
@@ -193,29 +190,54 @@ def _extract_report(output: str) -> dict | None:
     return None
 
 
-def _extract_fc_args(event) -> dict | None:
-    """Return submit_report arguments if this event carries a function call."""
-    candidates = [
-        getattr(event, "step", None),
-        getattr(event, "function_call", None),
-        getattr(event, "delta", None),
-    ]
-    for obj in candidates:
-        if obj is None:
-            continue
-        name = getattr(obj, "name", None)
-        if name and name != "submit_report":
-            continue
-        for attr in ("arguments", "args", "parameters"):
-            val = getattr(obj, attr, None)
-            if isinstance(val, dict):
-                return val
-            if isinstance(val, str):
-                try:
-                    return json.loads(val)
-                except json.JSONDecodeError:
-                    pass
+def _fc_args_from_step(step) -> dict | None:
+    """Return submit_report arguments from a single Step, if it is that call.
+
+    A ``FunctionCallStep`` has ``type == "function_call"``, ``name``, and
+    ``arguments`` — which the Managed Agents SDK delivers as an already-parsed
+    ``dict`` (not a JSON string). We ignore empty-argument steps so a partially
+    populated ``step.start`` never clobbers the final value.
+    """
+    if step is None:
+        return None
+    if getattr(step, "type", None) != "function_call":
+        return None
+    if getattr(step, "name", None) != "submit_report":
+        return None
+    args = getattr(step, "arguments", None)
+    if isinstance(args, dict) and args:
+        return args
+    if isinstance(args, str) and args.strip():
+        try:
+            parsed = json.loads(args)
+            return parsed if isinstance(parsed, dict) else None
+        except json.JSONDecodeError:
+            return None
     return None
+
+
+def _fc_args_from_steps(steps) -> dict | None:
+    """Scan a list of Steps (from interaction.completed) for the submit_report call."""
+    for step in steps or []:
+        args = _fc_args_from_step(step)
+        if args is not None:
+            return args
+    return None
+
+
+def _normalize_report(report: dict, rs_id: str) -> dict:
+    """Coerce a raw report dict through the VariantReport model.
+
+    Guarantees the frontend receives every section plus the ``confidence`` and
+    ``sources`` defaults. If validation fails (e.g. a required section is
+    missing), fall back to the raw dict with ``variant_id`` backfilled so the
+    response is never empty.
+    """
+    report.setdefault("variant_id", rs_id)
+    try:
+        return VariantReport(**report).model_dump()
+    except Exception:
+        return report
 
 
 def _delta_text(delta) -> str:
@@ -291,12 +313,9 @@ async def run_analysis_streaming(rs_id: str):
             )
 
             fc_report: dict | None = None
-            fc_args_buf = ""
 
             for event in stream:
                 event_type = getattr(event, "event_type", None)
-                attrs = [a for a in dir(event) if not a.startswith("_")]
-                print(f"[DEBUG] event_type={event_type!r} attrs={attrs}", flush=True)
 
                 # Surface agent-side failures immediately.
                 if event_type == "error":
@@ -310,40 +329,32 @@ async def run_analysis_streaming(rs_id: str):
 
                 if event_type == "interaction.status_update":
                     status = getattr(event, "status", None)
-                    if status in ("failed", "cancelled", "budget_exceeded"):
+                    if status in ("failed", "cancelled", "incomplete", "budget_exceeded"):
                         raise RuntimeError(f"Interaction {status}")
                     continue
 
-                # Check for a complete submit_report function call.
-                fc = _extract_fc_args(event)
-                if fc is not None:
-                    fc_report = fc
-                    print(f"[DEBUG] submit_report function call captured: {fc}", flush=True)
+                # Authoritative source: the completed interaction carries the
+                # full list of steps, including the submit_report FunctionCallStep
+                # with its fully-populated arguments dict.
+                if event_type == "interaction.completed":
+                    interaction = getattr(event, "interaction", None)
+                    steps = getattr(interaction, "steps", None) if interaction else None
+                    fc = _fc_args_from_steps(steps)
+                    if fc is not None:
+                        fc_report = fc
+                    continue
 
-                # Accumulate incremental function-call argument chunks.
-                delta = getattr(event, "delta", None)
-                if delta is not None:
-                    dtype = getattr(delta, "type", None)
-                    if dtype in ("arguments_delta", "function_call"):
-                        name = getattr(delta, "name", None) or getattr(delta, "function_name", None)
-                        if name is None or name == "submit_report":
-                            chunk = (
-                                getattr(delta, "arguments_delta", None)
-                                or getattr(delta, "arguments", None)
-                                or ""
-                            )
-                            if chunk:
-                                fc_args_buf += chunk
-                                try:
-                                    fc_report = json.loads(fc_args_buf)
-                                except json.JSONDecodeError:
-                                    pass
-
-                # Stream text progress to the frontend.
-                if event_type == "step.delta":
+                # Real output streams via step.delta (incremental) and step.start
+                # (full step). A function call may also appear as a complete
+                # step.start — capture it as a fallback to interaction.completed.
+                if event_type == "step.start":
+                    step = getattr(event, "step", None)
+                    fc = _fc_args_from_step(step)
+                    if fc is not None:
+                        fc_report = fc
+                    text = _step_text(step)
+                elif event_type == "step.delta":
                     text = _delta_text(getattr(event, "delta", None))
-                elif event_type == "step.start":
-                    text = _step_text(getattr(event, "step", None))
                 else:
                     text = ""
 
@@ -352,20 +363,22 @@ async def run_analysis_streaming(rs_id: str):
                     sse = f"event: progress\ndata: {json.dumps({'text': text})}\n\n"
                     loop.call_soon_threadsafe(queue.put_nowait, sse)
 
+            # Prefer the structured function call; fall back to text-marker parsing
+            # in case the model printed a report instead of calling submit_report.
+            report = fc_report or _extract_report(full_output)
             print(
-                f"[DEBUG] fc_report={fc_report is not None} "
-                f"full_output length={len(full_output)} preview={full_output[:300]!r}",
+                f"[VariantAI] rs_id={rs_id} fc_call={fc_report is not None} "
+                f"report_parsed={report is not None} output_len={len(full_output)}",
                 flush=True,
             )
-            # Prefer the function call result; fall back to text marker extraction.
-            report = fc_report or _extract_report(full_output)
             if report:
+                report = _normalize_report(report, rs_id)
                 sse = f"event: complete\ndata: {json.dumps({'report': report})}\n\n"
             else:
                 payload = json.dumps(
                     {
                         "report": None,
-                        "raw_output": full_output,
+                        "raw_output": full_output[:2000],
                         "error": "Could not extract structured report",
                     }
                 )
