@@ -17,6 +17,10 @@ lib/
 lib64/
 .eggs/
 
+# The generic Python "lib/" rule above must NOT ignore the frontend source dir
+!frontend/lib/
+!frontend/lib/**
+
 # Virtual environments
 .venv/
 venv/
@@ -76,3 +80,6 @@ CLAUDE.md
 
 # Planning docs (local only)
 Milestones.md
+
+# Runtime data (global memory store, etc.)
+backend/data/

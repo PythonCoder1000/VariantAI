@@ -29,3 +29,23 @@ class VariantReport(BaseModel):
     bottom_line: str
     confidence: str = "medium"  # "high" | "medium" | "low"
     sources: list[dict] = []
+
+
+class ChatMessage(BaseModel):
+    role: str  # "user" | "assistant"
+    content: str
+
+
+class ChatRequest(BaseModel):
+    variant_id: str
+    report: dict | None = None
+    messages: list[ChatMessage]
+
+    @field_validator("messages")
+    @classmethod
+    def non_empty(cls, v: list[ChatMessage]) -> list[ChatMessage]:
+        if not v:
+            raise ValueError("messages must contain at least one message")
+        if v[-1].role != "user":
+            raise ValueError("the last message must be from the user")
+        return v
