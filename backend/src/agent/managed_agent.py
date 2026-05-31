@@ -137,10 +137,15 @@ def _extract_report(output: str) -> dict | None:
     """Parse the structured JSON report from agent output.
 
     Tries in order:
-    1. Exact ===REPORT_START=== / ===REPORT_END=== markers (with optional spaces).
-    2. Same markers but the JSON is wrapped in a markdown code fence inside them.
-    3. Fallback: character-level scan for any top-level JSON object that contains
-       all five required report sections.
+    1. ===REPORT_START=== / ===REPORT_END=== markers (tolerant of spaces/case).
+    2. Same markers with a markdown code fence inside them.
+    3. Standalone markdown ```json ... ``` code block.
+    4. Forward character scan for top-level JSON objects with all required fields.
+       Depth is reset on stray closing braces so that Python f-strings / code
+       execution output (which contain unbalanced ``{`` / ``}``) don't break the
+       tracker for the rest of the document.
+    5. Reverse scan from the end of the output — the report is always the last
+       thing the agent writes, so scanning backwards finds it fastest.
     """
     REQUIRED = {
         "clinical_risk",
@@ -150,6 +155,15 @@ def _extract_report(output: str) -> dict | None:
         "bottom_line",
     }
 
+    def _try(candidate: str) -> dict | None:
+        try:
+            data = json.loads(candidate)
+            if isinstance(data, dict) and REQUIRED.issubset(data.keys()):
+                return data
+        except (json.JSONDecodeError, ValueError):
+            pass
+        return None
+
     # Strategy 1 & 2: sentinel markers, tolerant of spaces and code fences
     marker_match = re.search(
         r"={3}\s*REPORT_START\s*={3}\s*(.*?)\s*={3}\s*REPORT_END\s*={3}",
@@ -158,17 +172,20 @@ def _extract_report(output: str) -> dict | None:
     )
     if marker_match:
         content = marker_match.group(1).strip()
-        # Strip surrounding markdown code fences (```json ... ``` or ``` ... ```)
         content = re.sub(r"^```(?:json)?\s*", "", content)
         content = re.sub(r"\s*```$", "", content).strip()
-        try:
-            data = json.loads(content)
-            if isinstance(data, dict):
-                return data
-        except json.JSONDecodeError:
-            pass
+        result = _try(content)
+        if result is not None:
+            return result
 
-    # Strategy 3: scan for any top-level JSON object with all 5 required fields
+    # Strategy 3: standalone markdown JSON code block
+    for block_match in re.finditer(r"```json\s*(.*?)\s*```", output, re.DOTALL):
+        result = _try(block_match.group(1))
+        if result is not None:
+            return result
+
+    # Strategy 4: forward character scan.
+    # Reset depth on stray `}` so Python f-strings / code blocks don't cascade.
     depth = 0
     start = None
     for i, ch in enumerate(output):
@@ -179,13 +196,36 @@ def _extract_report(output: str) -> dict | None:
         elif ch == "}":
             depth -= 1
             if depth == 0 and start is not None:
-                try:
-                    data = json.loads(output[start : i + 1])
-                    if isinstance(data, dict) and REQUIRED.issubset(data.keys()):
-                        return data
-                except json.JSONDecodeError:
-                    pass
+                result = _try(output[start : i + 1])
+                if result is not None:
+                    return result
                 start = None
+            elif depth < 0:
+                # Stray closing brace (inside a Python string / code output).
+                # Reset so the next `{` starts a fresh top-level object.
+                depth = 0
+                start = None
+
+    # Strategy 5: reverse scan — walk backwards finding brace-balanced blocks.
+    # The JSON report is the last thing the agent outputs, so this hits it first.
+    depth = 0
+    end = None
+    for i in range(len(output) - 1, -1, -1):
+        ch = output[i]
+        if ch == "}":
+            if depth == 0:
+                end = i
+            depth += 1
+        elif ch == "{":
+            depth -= 1
+            if depth == 0 and end is not None:
+                result = _try(output[i : end + 1])
+                if result is not None:
+                    return result
+                end = None
+            elif depth < 0:
+                depth = 0
+                end = None
 
     return None
 
@@ -321,7 +361,17 @@ async def run_analysis_streaming(rs_id: str):
                 if event_type == "interaction.completed":
                     interaction = getattr(event, "interaction", None)
                     steps = getattr(interaction, "steps", None) if interaction else None
-                    final_text = _final_text_from_steps(steps)
+                    ft = _final_text_from_steps(steps)
+                    if ft:
+                        final_text = ft
+                    print(
+                        f"[VariantAI] interaction.completed:"
+                        f" has_interaction={interaction is not None}"
+                        f" has_steps={steps is not None}"
+                        f" step_count={len(steps) if steps else 0}"
+                        f" final_text_len={len(ft)}",
+                        flush=True,
+                    )
                     continue
 
                 # Stream progress text to the frontend (step.delta incremental,
@@ -346,6 +396,10 @@ async def run_analysis_streaming(rs_id: str):
                 f"final_len={len(final_text)} stream_len={len(full_output)}",
                 flush=True,
             )
+            if report is None:
+                # Log the tail of the stream so the failure can be diagnosed.
+                tail = (final_text or full_output)[-3000:]
+                print(f"[VariantAI] stream_tail:\n{tail}", flush=True)
             if report:
                 report = _normalize_report(report, rs_id)
                 sse = f"event: complete\ndata: {json.dumps({'report': report})}\n\n"
