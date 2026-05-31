@@ -32,6 +32,15 @@ async def _fake_stream(rs_id: str) -> AsyncGenerator[str, None]:
     yield f"event: complete\ndata: {json.dumps({'report': report})}\n\n"
 
 
+@pytest_asyncio.fixture(autouse=True)
+def reset_rate_limiter():
+    """Clear the in-memory rate-limit counters before each test so the limiter
+    doesn't accumulate across the test suite and cause spurious 429s."""
+    from src.api.main import limiter
+
+    limiter._storage.reset()
+
+
 @pytest_asyncio.fixture
 async def client():
     with patch("src.api.main.ensure_agent_exists"):

@@ -1,3 +1,6 @@
+"use client";
+
+import { useState } from "react";
 import SectionCard from "./SectionCard";
 import SourceBadge from "./SourceBadge";
 
@@ -24,8 +27,41 @@ const CONFIDENCE_BADGE: Record<string, string> = {
   low:    "bg-red-950 text-red-400 border-red-800",
 };
 
+function buildPlainText(report: VariantReport): string {
+  return [
+    `VariantAI Report: ${report.variant_id.toUpperCase()}`,
+    report.gene
+      ? `Gene: ${report.gene}${report.variant_type ? ` · ${report.variant_type}` : ""}`
+      : "",
+    `Confidence: ${report.confidence}`,
+    "",
+    `CLINICAL RISK\n${report.clinical_risk}`,
+    "",
+    `GENE FUNCTION\n${report.gene_function}`,
+    "",
+    `STRUCTURAL IMPACT\n${report.structural_impact}`,
+    "",
+    `RESEARCH SUMMARY\n${report.research_summary}`,
+    "",
+    `BOTTOM LINE\n${report.bottom_line}`,
+  ]
+    .filter((line) => line !== undefined)
+    .join("\n");
+}
+
 export default function ReportCard({ report }: Props) {
+  const [copied, setCopied] = useState(false);
   const badgeClass = CONFIDENCE_BADGE[report.confidence] ?? CONFIDENCE_BADGE.medium;
+
+  const handleCopy = async () => {
+    try {
+      await navigator.clipboard.writeText(buildPlainText(report));
+      setCopied(true);
+      setTimeout(() => setCopied(false), 2000);
+    } catch {
+      // clipboard denied — silently ignore
+    }
+  };
 
   return (
     <div className="mt-8 space-y-4">
@@ -42,9 +78,20 @@ export default function ReportCard({ report }: Props) {
             </p>
           )}
         </div>
-        <span className={`mt-1 px-3 py-1 rounded-full text-xs font-semibold border ${badgeClass} whitespace-nowrap`}>
-          {report.confidence} confidence
-        </span>
+        <div className="flex items-center gap-2 mt-1">
+          <button
+            onClick={handleCopy}
+            className="px-3 py-1 rounded-lg text-xs font-medium border border-gray-700
+                       text-gray-400 hover:text-gray-200 hover:border-gray-500
+                       transition-colors duration-150 whitespace-nowrap"
+            aria-label="Copy report as plain text"
+          >
+            {copied ? "Copied!" : "Copy as text"}
+          </button>
+          <span className={`px-3 py-1 rounded-full text-xs font-semibold border ${badgeClass} whitespace-nowrap`}>
+            {report.confidence} confidence
+          </span>
+        </div>
       </div>
 
       {/* Report Sections */}

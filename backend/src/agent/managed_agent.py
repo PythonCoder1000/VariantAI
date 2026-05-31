@@ -2,6 +2,9 @@ import asyncio
 import json
 import os
 import re
+import time
+
+import httpx
 
 from ..models.schemas import VariantReport
 from .agents_md import AGENTS_MD
@@ -53,6 +56,51 @@ REPORT_RESPONSE_FORMAT: dict = {
 
 AGENT_ID = "variantai-agent"
 BASE_AGENT = "antigravity-preview-05-2026"
+
+# ---------------------------------------------------------------------------
+# In-memory report cache (keyed by rsID, expires after 24 h)
+# ---------------------------------------------------------------------------
+_CACHE_TTL = 86400.0  # seconds
+_report_cache: dict[str, tuple[dict, float]] = {}
+
+
+def _get_cached(rs_id: str) -> dict | None:
+    entry = _report_cache.get(rs_id)
+    if entry is None:
+        return None
+    report, ts = entry
+    if time.monotonic() - ts < _CACHE_TTL:
+        return report
+    del _report_cache[rs_id]
+    return None
+
+
+def _set_cached(rs_id: str, report: dict) -> None:
+    _report_cache[rs_id] = (report, time.monotonic())
+
+
+# ---------------------------------------------------------------------------
+# Pre-flight: verify the rsID exists in dbSNP before burning an agent run
+# ---------------------------------------------------------------------------
+
+
+def _check_variant_exists(rs_id: str) -> bool:
+    """Return False only when dbSNP definitively returns HTTP 404 for this rsID.
+
+    Any other status (200, 5xx, timeout, network error) returns True so the
+    agent run proceeds — fail-open to avoid false "unknown variant" pages.
+    """
+    try:
+        rs_num = rs_id.lstrip("rRsS")
+        resp = httpx.get(
+            f"https://api.ncbi.nlm.nih.gov/variation/v0/beta/refsnp/{rs_num}",
+            headers={"Accept": "application/json"},
+            timeout=8.0,
+        )
+        return resp.status_code != 404
+    except Exception:
+        return True
+
 
 # Domains the agent sandbox is allowed to reach
 NETWORK_ALLOWLIST = [
@@ -311,17 +359,33 @@ async def run_analysis_streaming(rs_id: str):
     Yields lines in one of these formats:
       "event: progress\\ndata: {\"text\": \"...\"}\\n\\n"
       "event: complete\\ndata: {\"report\": {...}}\\n\\n"
+      "event: not_found\\ndata: {\"variant_id\": \"...\"}\\n\\n"
       "event: error\\ndata: {\"error\": \"...\"}\\n\\n"
 
     The Google genai SDK streaming call is synchronous, so it is run in a
     thread via asyncio.to_thread to avoid blocking the FastAPI event loop.
     """
+    # Serve from cache without touching the agent.
+    cached = _get_cached(rs_id)
+    if cached is not None:
+        yield f"event: progress\ndata: {json.dumps({'text': 'Loading from cache…'})}\n\n"
+        yield f"event: complete\ndata: {json.dumps({'report': cached})}\n\n"
+        return
+
     loop = asyncio.get_event_loop()
     queue: asyncio.Queue[str | None] = asyncio.Queue()
 
     def _run_sync() -> None:
         client = get_client()
         ensure_agent_exists()
+
+        # Pre-flight: skip the full agent run if the rsID is not in dbSNP.
+        if not _check_variant_exists(rs_id):
+            sse = f"event: not_found\ndata: {json.dumps({'variant_id': rs_id})}\n\n"
+            loop.call_soon_threadsafe(queue.put_nowait, sse)
+            loop.call_soon_threadsafe(queue.put_nowait, None)
+            return
+
         prompt = _build_prompt(rs_id)
         full_output = ""
 
@@ -402,6 +466,7 @@ async def run_analysis_streaming(rs_id: str):
                 print(f"[VariantAI] stream_tail:\n{tail}", flush=True)
             if report:
                 report = _normalize_report(report, rs_id)
+                _set_cached(rs_id, report)
                 sse = f"event: complete\ndata: {json.dumps({'report': report})}\n\n"
             else:
                 payload = json.dumps(
