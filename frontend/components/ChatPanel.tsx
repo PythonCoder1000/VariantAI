@@ -1,7 +1,8 @@
 "use client";
 
-import { useEffect, useRef, useState, type FormEvent } from "react";
+import { memo, useLayoutEffect, useRef, useState, type FormEvent } from "react";
 import type { ChatMessage } from "@/lib/types";
+import Markdown from "./Markdown";
 
 interface Props {
   variantId: string;
@@ -17,33 +18,63 @@ const SUGGESTIONS = [
   "How was this variant studied?",
 ];
 
-function MessageBubble({ message }: { message: ChatMessage }) {
+const MessageBubble = memo(function MessageBubble({ message }: { message: ChatMessage }) {
   const isUser = message.role === "user";
   return (
     <div className={`flex ${isUser ? "justify-end" : "justify-start"}`}>
       <div
-        className={`animate-fade-in-up max-w-[85%] whitespace-pre-wrap rounded-2xl px-4 py-2.5 text-sm leading-relaxed ${
+        className={`animate-fade-in-up max-w-[85%] rounded-2xl px-4 py-2.5 text-sm leading-relaxed ${
           isUser
-            ? "rounded-br-sm bg-blue-600 text-white"
+            ? "whitespace-pre-wrap rounded-br-sm bg-blue-600 text-white"
             : "rounded-bl-sm bg-gray-800 text-gray-100"
         }`}
       >
-        {message.content}
-        {message.pending && (
+        {isUser ? (
+          message.content
+        ) : (
+          <>
+            <Markdown content={message.content} />
+            {message.pending && message.content === "" && (
+              <span className="inline-flex gap-1 py-0.5" aria-label="Thinking">
+                <span className="h-1.5 w-1.5 animate-dot rounded-full bg-gray-400" style={{ animationDelay: "0ms" }} />
+                <span className="h-1.5 w-1.5 animate-dot rounded-full bg-gray-400" style={{ animationDelay: "150ms" }} />
+                <span className="h-1.5 w-1.5 animate-dot rounded-full bg-gray-400" style={{ animationDelay: "300ms" }} />
+              </span>
+            )}
+          </>
+        )}
+        {!isUser && message.pending && message.content !== "" && (
           <span className="ml-0.5 inline-block h-3.5 w-1.5 animate-pulse bg-gray-400 align-text-bottom" />
         )}
       </div>
     </div>
   );
-}
+});
 
 export default function ChatPanel({ variantId, messages, busy, onSend }: Props) {
   const [draft, setDraft] = useState("");
-  const endRef = useRef<HTMLDivElement>(null);
+  const listRef = useRef<HTMLDivElement>(null);
+  const prevVariant = useRef(variantId);
+  const prevLen = useRef(messages.length);
 
-  useEffect(() => {
-    endRef.current?.scrollIntoView({ behavior: "smooth", block: "end" });
-  }, [messages]);
+  // Auto-scroll the messages container ONLY (never the whole page — scrolling
+  // the page is what made switching chats feel slow). useLayoutEffect runs
+  // synchronously after commit on the live node, so it can't race a stale ref.
+  // Smooth-scroll only when a new message is appended within the same chat;
+  // switching chats, mounting, and streaming deltas jump to the bottom instantly.
+  useLayoutEffect(() => {
+    const el = listRef.current;
+    if (!el) return;
+    const sameChat = prevVariant.current === variantId;
+    const appended = sameChat && messages.length > prevLen.current;
+    prevVariant.current = variantId;
+    prevLen.current = messages.length;
+    if (appended) {
+      el.scrollTo({ top: el.scrollHeight, behavior: "smooth" });
+    } else {
+      el.scrollTop = el.scrollHeight;
+    }
+  }, [messages, variantId]);
 
   const submit = (e: FormEvent) => {
     e.preventDefault();
@@ -63,7 +94,7 @@ export default function ChatPanel({ variantId, messages, busy, onSend }: Props) 
       </div>
 
       {/* Messages */}
-      <div className="max-h-[28rem] space-y-3 overflow-y-auto px-5 py-4">
+      <div ref={listRef} className="max-h-[28rem] space-y-3 overflow-y-auto px-5 py-4">
         {messages.length === 0 ? (
           <div className="py-2">
             <p className="mb-3 text-sm text-gray-500">
@@ -87,7 +118,6 @@ export default function ChatPanel({ variantId, messages, busy, onSend }: Props) 
         ) : (
           messages.map((m, i) => <MessageBubble key={i} message={m} />)
         )}
-        <div ref={endRef} />
       </div>
 
       {/* Input */}
