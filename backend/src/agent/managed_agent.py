@@ -8,7 +8,7 @@ from .client import get_client
 from .skills import ALL_SKILLS
 
 AGENT_ID = "variantai-agent"
-BASE_AGENT = "gemini-3.5-flash"
+BASE_AGENT = "antigravity-preview-05-2026"
 
 # Domains the agent sandbox is allowed to reach
 NETWORK_ALLOWLIST = [
@@ -89,18 +89,102 @@ Do not skip any step. Output the final report wrapped in ===REPORT_START=== / ==
 
 
 def _extract_report(output: str) -> dict | None:
-    """Parse the structured JSON report from between the sentinel markers."""
-    match = re.search(
-        r"===REPORT_START===\s*(.*?)\s*===REPORT_END===",
+    """Parse the structured JSON report from agent output.
+
+    Tries in order:
+    1. Exact ===REPORT_START=== / ===REPORT_END=== markers (with optional spaces).
+    2. Same markers but the JSON is wrapped in a markdown code fence inside them.
+    3. Fallback: character-level scan for any top-level JSON object that contains
+       all five required report sections.
+    """
+    REQUIRED = {
+        "clinical_risk",
+        "gene_function",
+        "structural_impact",
+        "research_summary",
+        "bottom_line",
+    }
+
+    # Strategy 1 & 2: sentinel markers, tolerant of spaces and code fences
+    marker_match = re.search(
+        r"={3}\s*REPORT_START\s*={3}\s*(.*?)\s*={3}\s*REPORT_END\s*={3}",
         output,
-        re.DOTALL,
+        re.DOTALL | re.IGNORECASE,
     )
-    if not match:
-        return None
-    try:
-        return json.loads(match.group(1))
-    except json.JSONDecodeError:
-        return None
+    if marker_match:
+        content = marker_match.group(1).strip()
+        # Strip surrounding markdown code fences (```json ... ``` or ``` ... ```)
+        content = re.sub(r"^```(?:json)?\s*", "", content)
+        content = re.sub(r"\s*```$", "", content).strip()
+        try:
+            data = json.loads(content)
+            if isinstance(data, dict):
+                return data
+        except json.JSONDecodeError:
+            pass
+
+    # Strategy 3: scan for any top-level JSON object with all 5 required fields
+    depth = 0
+    start = None
+    for i, ch in enumerate(output):
+        if ch == "{":
+            if depth == 0:
+                start = i
+            depth += 1
+        elif ch == "}":
+            depth -= 1
+            if depth == 0 and start is not None:
+                try:
+                    data = json.loads(output[start : i + 1])
+                    if isinstance(data, dict) and REQUIRED.issubset(data.keys()):
+                        return data
+                except json.JSONDecodeError:
+                    pass
+                start = None
+
+    return None
+
+
+def _delta_text(delta) -> str:
+    """Extract streamable text from a ``step.delta`` event's ``delta`` object.
+
+    The agent's prose and the final report stream as ``text`` deltas; skill
+    execution surfaces as ``arguments_delta`` / ``code_execution_call`` (the
+    code) and ``code_execution_result`` (stdout). All carry the keywords the
+    frontend uses for progress, and the report JSON arrives in ``text``.
+    """
+    if delta is None:
+        return ""
+    dtype = getattr(delta, "type", None)
+    if dtype == "text":
+        return getattr(delta, "text", "") or ""
+    if dtype == "arguments_delta":
+        return getattr(delta, "arguments", "") or ""
+    if dtype == "code_execution_call":
+        args = getattr(delta, "arguments", None)
+        return (getattr(args, "code", "") or "") if args is not None else ""
+    if dtype == "code_execution_result":
+        return getattr(delta, "result", "") or ""
+    return ""
+
+
+def _step_text(step) -> str:
+    """Extract text from a full ``Step`` object (carried by ``step.start``)."""
+    if step is None:
+        return ""
+    stype = getattr(step, "type", None)
+    if stype == "model_output":
+        return "".join(
+            content.text
+            for content in (getattr(step, "content", None) or [])
+            if getattr(content, "type", None) == "text" and getattr(content, "text", None)
+        )
+    if stype == "code_execution_call":
+        args = getattr(step, "arguments", None)
+        return (getattr(args, "code", "") or "") if args is not None else ""
+    if stype == "code_execution_result":
+        return getattr(step, "result", "") or ""
+    return ""
 
 
 async def run_analysis_streaming(rs_id: str):
@@ -133,13 +217,34 @@ async def run_analysis_streaming(rs_id: str):
             )
 
             for event in stream:
-                # The event object may expose text via different attributes
-                # depending on the SDK version; try all common ones.
-                text = (
-                    getattr(event, "text", None)
-                    or getattr(event, "output_text", None)
-                    or str(event)
-                )
+                event_type = getattr(event, "event_type", None)
+
+                # Surface agent-side failures immediately.
+                if event_type == "error":
+                    err = getattr(event, "error", None)
+                    message = (
+                        getattr(err, "message", None)
+                        or getattr(err, "code", None)
+                        or "Agent returned an error event"
+                    )
+                    raise RuntimeError(message)
+
+                if event_type == "interaction.status_update":
+                    status = getattr(event, "status", None)
+                    if status in ("failed", "cancelled", "budget_exceeded"):
+                        raise RuntimeError(f"Interaction {status}")
+                    continue
+
+                # Real output streams via step.delta (incremental) and
+                # step.start (full step). The interaction.completed event
+                # intentionally carries empty steps, so we never rely on it.
+                if event_type == "step.delta":
+                    text = _delta_text(getattr(event, "delta", None))
+                elif event_type == "step.start":
+                    text = _step_text(getattr(event, "step", None))
+                else:
+                    text = ""
+
                 if text:
                     full_output += text
                     sse = f"event: progress\ndata: {json.dumps({'text': text})}\n\n"

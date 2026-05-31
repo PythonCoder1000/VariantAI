@@ -12,7 +12,7 @@ load_dotenv()
 
 app = FastAPI(
     title="VariantAI API",
-    version="0.5.0",
+    version="0.7.0",
     description="Genomic variant analysis powered by Google Managed Agents (Gemini 3.5 Flash)",
 )
 
@@ -36,7 +36,7 @@ async def startup_event():
 
 @app.get("/api/health")
 async def health_check():
-    return {"status": "ok", "version": "0.5.0"}
+    return {"status": "ok", "version": "0.7.0"}
 
 
 @app.post("/api/analyze")
